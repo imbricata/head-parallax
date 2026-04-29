@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Head Parallax</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #000;
+      overflow: hidden;
+      font-family: 'SF Mono', 'Courier New', monospace;
+    }
+
+    #canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+    }
+
+    #preview {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      width: 140px;
+      height: 105px;
+      border-radius: 10px;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      transform: scaleX(-1);
+      opacity: 0.6;
+      object-fit: cover;
+      background: #111;
+    }
+
+    #status {
+      position: fixed;
+      top: 18px;
+      left: 20px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: rgba(255, 255, 255, 0.38);
+      font-size: 11px;
+      pointer-events: none;
+      transition: opacity 0.8s;
+    }
+
+    #dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #444;
+      flex-shrink: 0;
+      transition: background 0.3s;
+    }
+
+    #dot.on  { background: #44ff88; }
+    #dot.err { background: #ff4444; }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <video id="preview" autoplay playsinline muted></video>
+  <div id="status">
+    <div id="dot"></div>
+    <span id="msg">Loading…</span>
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.module.js"
+    }
+  }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { FaceLandmarker, FilesetResolver }
+      from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/vision_bundle.mjs';
+
+    // ─── Renderer ─────────────────────────────────────────────────────────────
+
+    const renderer = new THREE.WebGLRenderer({
+      canvas: document.getElementById('canvas'),
+      antialias: true
+    });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.05;
+
+    // ─── Scene ────────────────────────────────────────────────────────────────
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x05050e);
+    scene.fog = new THREE.FogExp2(0x05050e, 0.030);
+
+    // ─── Camera ───────────────────────────────────────────────────────────────
+    // Wider FOV (65°) so the corridor walls are visible and the room feels real
+
+    const BASE_Z = 6;
+    const cam = new THREE.PerspectiveCamera(65, innerWidth / innerHeight, 0.1, 100);
+    cam.position.set(0, 0, BASE_Z);
+
+    // ─── Lights ───────────────────────────────────────────────────────────────
+
+    scene.add(new THREE.AmbientLight(0x0a0a1a, 1.0));
+
+    const key = new THREE.DirectionalLight(0xffffff, 2.2);
+    key.position.set(4, 9, 6);
+    scene.add(key);
+
+    // Blue from deep-left — main cool fill
+    const blueLight = new THREE.PointLight(0x0055ff, 7, 28);
+    blueLight.position.set(-6, 2, -7);
+    scene.add(blueLight);
+
+    // Magenta from right-front — warm accent on close objects
+    const magLight = new THREE.PointLight(0xff0077, 5, 18);
+    magLight.position.set(6, -2, 1);
+    scene.add(magLight);
+
+    // Cyan from above-centre — mid-scene fill
+    const cyanLight = new THREE.PointLight(0x00ffdd, 3, 20);
+    cyanLight.position.set(0, 5, -9);
+    scene.add(cyanLight);
+
+    // ─── ROOM ─────────────────────────────────────────────────────────────────
+    //
+    // A box corridor the camera sits inside.
+    //   near face:  Z = +8  (behind the camera at Z=6, never visible)
+    //   far face:   Z = -20 (deep background)
+    //   width:      10 units  (X: ±5)
+    //   height:     7 units   (Y: ±3.5)
+    //
+    // Built as two overlapping LineSegments:
+    //   1. Bright frame  — just the 12 outer edges (unsubdivided box)
+    //   2. Dim grid      — all internal grid lines (subdivided box)
+
+    const ROOM_W = 10, ROOM_H = 7, ROOM_D = 28;
+    const roomCenter = new THREE.Vector3(0, 0, -6); // (8 + -20) / 2
+
+    const frameMat = new THREE.LineBasicMaterial({
+      color: 0x1144ff,
+      transparent: true,
+      opacity: 0.75
+    });
+    const gridMat = new THREE.LineBasicMaterial({
+      color: 0x0a1a88,
+      transparent: true,
+      opacity: 0.28
+    });
+
+    // Outer frame — 12 sharp edges
+    const frameLines = new THREE.LineSegments(
+      new THREE.EdgesGeometry(new THREE.BoxGeometry(ROOM_W, ROOM_H, ROOM_D)),
+      frameMat
+    );
+    frameLines.position.copy(roomCenter);
+    scene.add(frameLines);
+
+    // Grid overlay — subdivided (5 cols × 3 rows × 14 depth slices)
+    const gridLines = new THREE.LineSegments(
+      new THREE.EdgesGeometry(new THREE.BoxGeometry(ROOM_W, ROOM_H, ROOM_D, 5, 3, 14)),
+      gridMat
+    );
+    gridLines.position.copy(roomCenter);
+    scene.add(gridLines);
+
+    // ─── Shapes ───────────────────────────────────────────────────────────────
+    //
+    // Each shape sits at a different Z depth — this is what creates the
+    // parallax when the camera translates: closer objects shift further on
+    // screen than distant ones (standard perspective projection).
+    //
+    // Each has a distinct hue so you can track the depth layers easily.
+
+    const mat = (hex, roughness = 0.2, metalness = 0.8) =>
+      new THREE.MeshStandardMaterial({ color: hex, roughness, metalness });
+
+    const defs = [
+      // geometry                                   material          [ x,    y,    z  ]   [rx,   ry,   rz]
+      [new THREE.SphereGeometry(0.62, 48, 48),      mat(0x33ddff),   [ 0.4,  0.3,  3.0], [0.001, 0.003, 0.000]],  // cyan — very close
+      [new THREE.BoxGeometry(1.0, 1.0, 1.0),        mat(0xff9922),   [-2.5,  0.8, -0.5], [0.003, 0.005, 0.001]],  // orange
+      [new THREE.TorusGeometry(0.78, 0.27, 18, 72), mat(0xff2277, 0.35), [2.3, -0.8, -3.0], [0.004, 0.002, 0.005]], // magenta
+      [new THREE.OctahedronGeometry(0.72),           mat(0x33ff99),   [-1.0,  1.5, -7.5], [0.005, 0.003, 0.002]],  // green
+      [new THREE.TetrahedronGeometry(0.68),          mat(0xffee22),   [ 2.6, -1.5,-10.5], [0.002, 0.006, 0.003]],  // yellow
+      [new THREE.TorusKnotGeometry(0.48, 0.15, 96, 12), mat(0xaa33ff, 0.3), [0, 0.5, -16.0], [0.002, 0.004, 0.003]], // violet — deep background
+    ];
+
+    const meshes = defs.map(([geo, material, pos, spd]) => {
+      const mesh = new THREE.Mesh(geo, material);
+      mesh.position.set(...pos);
+      mesh.userData.spd = spd;
+      scene.add(mesh);
+      return mesh;
+    });
+
+    window.addEventListener('resize', () => {
+      cam.aspect = innerWidth / innerHeight;
+      cam.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+
+    // ─── Camera parallax state ────────────────────────────────────────────────
+
+    let tX = 0, tY = 0, tZ = BASE_Z;
+    let cX = 0, cY = 0, cZ = BASE_Z;
+
+    const LERP = 0.08;
+
+    // ─── MediaPipe face tracking ──────────────────────────────────────────────
+
+    const video  = document.getElementById('preview');
+    const dot    = document.getElementById('dot');
+    const msg    = document.getElementById('msg');
+    let detector = null;
+    let lastVidT = -1;
+
+    const BASELINE_FACE_W = 0.31;
+    const X_SENS = 4.0;
+    const Y_SENS = 2.5;
+    const Z_SENS = 9.0;
+    const Z_MIN  = 2.5;
+    const Z_MAX  = 10.0;
+
+    async function initTracker() {
+      msg.textContent = 'Loading face model…';
+
+      const fs = await FilesetResolver.forVisionTasks(
+        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm'
+      );
+      detector = await FaceLandmarker.createFromOptions(fs, {
+        baseOptions: {
+          modelAssetPath:
+            'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+          delegate: 'GPU'
+        },
+        runningMode: 'VIDEO',
+        numFaces: 1
+      });
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 640, height: 480, facingMode: 'user' }
+      });
+      video.srcObject = stream;
+      await new Promise(r => video.addEventListener('loadeddata', r, { once: true }));
+
+      msg.textContent = 'Move your head to shift perspective';
+      dot.classList.add('on');
+      setTimeout(() => {
+        document.getElementById('status').style.opacity = '0';
+      }, 4000);
+    }
+
+    function detectFace() {
+      if (!detector || video.readyState < 2 || video.currentTime === lastVidT) return;
+      lastVidT = video.currentTime;
+
+      const { faceLandmarks } = detector.detectForVideo(video, performance.now());
+
+      if (faceLandmarks?.length) {
+        const lm    = faceLandmarks[0];
+        const nose  = lm[4];
+        const faceW = Math.abs(lm[454].x - lm[234].x);
+
+        tX = -(nose.x - 0.5) * X_SENS;
+        tY = -(nose.y - 0.5) * Y_SENS;
+        tZ = Math.max(Z_MIN, Math.min(Z_MAX,
+          BASE_Z - (faceW - BASELINE_FACE_W) * Z_SENS
+        ));
+
+        dot.classList.add('on');
+      } else {
+        tX = 0; tY = 0; tZ = BASE_Z;
+        dot.classList.remove('on');
+      }
+    }
+
+    // ─── Render loop ──────────────────────────────────────────────────────────
+
+    function tick() {
+      requestAnimationFrame(tick);
+
+      detectFace();
+
+      cX += (tX - cX) * LERP;
+      cY += (tY - cY) * LERP;
+      cZ += (tZ - cZ) * LERP;
+
+      // Pure translation — keeping rotation at zero is what creates the
+      // "window into 3D space" effect. The room grid makes the parallax
+      // dramatically visible since the frame edges converge in perspective.
+      cam.position.set(cX, cY, cZ);
+      cam.rotation.set(0, 0, 0);
+
+      for (const m of meshes) {
+        const s = m.userData.spd;
+        m.rotation.x += s[0];
+        m.rotation.y += s[1];
+        m.rotation.z += s[2];
+      }
+
+      renderer.render(scene, cam);
+    }
+
+    tick();
+    initTracker().catch(err => {
+      msg.textContent = `Camera error: ${err.message}`;
+      dot.classList.add('err');
+    });
+  </script>
+</body>
+</html>
